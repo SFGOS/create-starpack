@@ -1106,7 +1106,7 @@ bool packageStarpack(const std::string &starbuildDirStr,
         log_message("Created symlink: " + linkPath.string() + " -> " + pair.second);
     }
 
-    // 4) Use tar & gzip to produce the final .starpack
+    // 4) Use tar & zstd to produce the final .starpack
     //    Transform paths so that leading "./" => "files/", except for metadata.yaml => "metadata.yaml"
     auto shellEscape = [](const std::string &path) {
         std::ostringstream oss;
@@ -1121,14 +1121,14 @@ bool packageStarpack(const std::string &starbuildDirStr,
         << "--transform=\"s|^\\./hooks|hooks|\" "
         << "--transform='s|^\\./|files/|' "
         << "-cf - ."
-        << " | gzip -9"
+        << " | zstd --ultra -22 -v" // Added zstd compression
         << " > " << shellEscape(outputFile);
 
     log_message("Running tar command:\n" + cmd.str());
 
     int ret = std::system(cmd.str().c_str());
     if (ret != 0) {
-        log_error("tar|gzip command failed with exit code " + std::to_string(ret));
+        log_error("tar|zstd command failed with exit code " + std::to_string(ret));
         return false;
     }
 
@@ -1167,7 +1167,7 @@ void cleanupBuildArtifacts(const fs::path &starbuildDir,
  *        - fetchSources
  *        - running user scripts (prepare, compile, verify, assemble)
  *        - postProcessFiles (strip, remove .la/.a)
- *        - packageStarpack (tar+gzip)
+ *        - packageStarpack (tar+zstd)
  *        - optional cleanup of intermediate artifacts
  *
  * @param starbuildPath Path to the STARBUILD file
@@ -1358,7 +1358,7 @@ bool createPackage(const std::string &starbuildPath, bool clean)
         std::string outputFile =
             (fs::path(srcdir) / (pkgName + "-" + package_version + ".starpack")).string();
 
-        // Tar+gzip the subpackage
+        // Tar+zstd the subpackage
         bool ok = packageStarpack(
             starbuildDir.string(),
             pkgDir.string(),
