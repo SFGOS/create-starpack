@@ -95,6 +95,10 @@ namespace Starpack
          */
         bool useFakeroot = (geteuid() != 0);
 
+        std::vector<std::string> clashes;
+        std::vector<std::string> gives;
+        std::vector<std::string> optional_dependencies;
+
         //------------------------------------------------------------------------------
         // parse_starbuild
         //------------------------------------------------------------------------------
@@ -114,6 +118,10 @@ namespace Starpack
             std::string &description,
             std::vector<std::string> &dependencies,
             std::vector<std::string> &build_dependencies,
+            // NEW
+            std::vector<std::string> &clashes,
+            std::vector<std::string> &gives,
+            std::vector<std::string> &optional_dependencies,
             std::vector<std::string> &sources,
             std::string &prepare_function,
             std::string &compile_function,
@@ -136,6 +144,9 @@ namespace Starpack
             std::regex re_description("description\\s*=\\s*\"(.*)\"");
             std::regex re_dependencies("^dependencies\\s*=\\s*\\((.*)\\)");
             std::regex re_build_dependencies("^build_dependencies\\s*=\\s*\\((.*)\\)");
+            std::regex re_clashes("^clashes\\s*=\\s*\\((.*)\\)");
+            std::regex re_gives("^gives\\s*=\\s*\\((.*)\\)");
+            std::regex re_optional_dependencies("^optional_dependencies\\s*=\\s*\\((.*)\\)");
 
             bool in_prepare = false;
             bool in_compile = false;
@@ -264,6 +275,30 @@ namespace Starpack
                 {
                     auto words = extract_quoted_strings(match[1].str());
                     build_dependencies.insert(build_dependencies.end(), words.begin(), words.end());
+                    continue;
+                }
+
+                // parse clashes = ( "pkgA" "pkgB<2.0" )
+                if (std::regex_search(trimmed, match, re_clashes))
+                {
+                    auto words = extract_quoted_strings(match[1].str());
+                    clashes.insert(clashes.end(), words.begin(), words.end());
+                    continue;
+                }
+
+                // parse gives = ( "virtual-foo" )
+                if (std::regex_search(trimmed, match, re_gives))
+                {
+                    auto words = extract_quoted_strings(match[1].str());
+                    gives.insert(gives.end(), words.begin(), words.end());
+                    continue;
+                }
+
+                // parse optional_dependencies = ( "opt1" "opt2>=3" )
+                if (std::regex_search(trimmed, match, re_optional_dependencies))
+                {
+                    auto words = extract_quoted_strings(match[1].str());
+                    optional_dependencies.insert(optional_dependencies.end(), words.begin(), words.end());
                     continue;
                 }
 
@@ -1266,7 +1301,7 @@ namespace Starpack
                 << "--transform=\"s|^\\./hooks|hooks|\" "
                 << "--transform='s|^\\./|files/|' "
                 << "-cf - ."
-                << " | zstd --ultra -22 -v" // Added zstd compression
+                << " | zstd --ultra --long -22 -v" // Added zstd compression
                 << " > " << shellEscape(outputFile);
 
             log_message("Running tar command:\n" + cmd.str());
@@ -1356,6 +1391,10 @@ namespace Starpack
                     description,
                     dependencies,
                     build_dependencies,
+                    // NEW
+                    clashes,
+                    gives,
+                    optional_dependencies,
                     sources,
                     prepare_function,
                     compile_function,
@@ -1459,27 +1498,39 @@ namespace Starpack
                 // and ending with ".hook". It captures the hook phase.
                 std::regex hookPattern(("^" + pkgName + "-(.+\\.hook)$").c_str(), std::regex_constants::icase);
 
+                bool singlePackageBuild = (package_names.size() == 1);
+
+                std::regex hookPattern(
+                    singlePackageBuild
+                        ? ("^(" + pkgName + "-)?(.+\\.hook)$") // 2nd group = "phase.hook"
+                        : ("^" + pkgName + "-(.+\\.hook)$"),   // 1st group = "phase.hook"
+                    std::regex_constants::icase);
+
                 // Iterate over the starbuild directory files.
-                for (auto &entry : fs::directory_iterator(starbuildDir))
+                for (const auto &entry : fs::directory_iterator(starbuildDir))
                 {
                     if (!entry.is_regular_file())
                         continue;
-                    std::string filename = entry.path().filename().string();
+
+                    const std::string filename = entry.path().filename().string();
                     std::smatch match;
+
                     if (std::regex_match(filename, match, hookPattern))
                     {
-                        // match holds the desired hook name, e.g. "postinstall.hook" or "preupdate.hook".
-                        std::string newFilename = match[1].str();
+                        // Determine the final filename stored in the package.
+                        std::string newFilename = singlePackageBuild ? match[2].str()  // "phase.hook"
+                                                                     : match[1].str(); // "phase.hook"
+
                         fs::path dest = pkgHooksDir / newFilename;
                         try
                         {
-                            fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing);
-                            log_message("Copied package-specific hook " + filename + " as " +
-                                        newFilename + " => " + dest.string());
+                            fs::copy_file(entry.path(), dest,
+                                          fs::copy_options::overwrite_existing);
+                            log_message("Copied hook " + filename + " → " + dest.string());
                         }
                         catch (const fs::filesystem_error &ex)
                         {
-                            log_error("Failed to copy package-specific hook " + filename + ": " + ex.what());
+                            log_error("Failed to copy hook " + filename + ": " + ex.what());
                         }
                     }
                 }
@@ -1546,6 +1597,22 @@ namespace Starpack
                     depsNode.push_back(dep);
                 }
                 metadata["dependencies"] = depsNode;
+
+                // ----- new fields -----
+                auto pushSeq = [&](const std::vector<std::string> &src,
+                                   const char *key)
+                {
+                    if (src.empty())
+                        return;
+                    YAML::Node n(YAML::NodeType::Sequence);
+                    for (auto &s : src)
+                        n.push_back(s);
+                    metadata[key] = n;
+                };
+
+                pushSeq(clashes, "clashes");
+                pushSeq(gives, "gives");
+                pushSeq(optional_dependencies, "optional_dependencies");
 
                 // Turn the YAML node into a string
                 YAML::Emitter emitter;
@@ -1653,7 +1720,6 @@ int main(int argc, char *argv[])
     else
     {
         // The user is NOT root, so no special warning is needed.
-        // You can still do a mild informational message if desired:
         std::cerr << "Running create-starpack as a non-root user. Proceeding...\n";
     }
 
