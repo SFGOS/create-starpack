@@ -99,6 +99,45 @@ namespace Starpack
         std::vector<std::string> gives;
         std::vector<std::string> optional_dependencies;
 
+        // resume support definition
+        // This is used to save the current state of the build process
+        struct ResumeState
+        {
+            std::string phase; // "prepare", "compile", "verify", or "assemble"
+            int pkgIndex;      // which subpackage (0-based), valid only if phase=="assemble"
+        };
+        static ResumeState currentState;
+        static fs::path resumeFile; // starbuildDir / ".starpack_resume"
+        // This is used to save the current state of the build process
+        // Write out currentState to disk
+        static void saveResumeState(const fs::path &starbuildDir)
+        {
+            resumeFile = starbuildDir / ".starpack_resume";
+            std::ofstream out(resumeFile, std::ios::trunc);
+            if (!out)
+                return;
+            out << currentState.phase << "\n"
+                << currentState.pkgIndex << "\n";
+        }
+
+        // Load it on startup
+        static bool loadResumeState(const fs::path &starbuildDir)
+        {
+            resumeFile = starbuildDir / ".starpack_resume";
+            std::ifstream in(resumeFile);
+            if (!in)
+                return false;
+            in >> currentState.phase >> currentState.pkgIndex;
+            return true;
+        }
+
+        // Remove the resume file when we’re fully done
+        static void clearResumeState()
+        {
+            if (!resumeFile.empty() && fs::exists(resumeFile))
+                fs::remove(resumeFile);
+        }
+
         //------------------------------------------------------------------------------
         // parse_starbuild
         //------------------------------------------------------------------------------
@@ -128,7 +167,9 @@ namespace Starpack
             std::string &verify_function,
             std::string &generic_assemble_function,
             std::unordered_map<std::string, std::string> &assemble_functions,
-            std::vector<std::pair<std::string, std::string>> &symlinkPairs)
+            std::vector<std::pair<std::string, std::string>> &symlinkPairs,
+            std::vector<std::string> &customFunctions)
+
         {
             std::ifstream file(filepath);
             if (!file)
@@ -147,6 +188,10 @@ namespace Starpack
             std::regex re_clashes("^clashes\\s*=\\s*\\((.*)\\)");
             std::regex re_gives("^gives\\s*=\\s*\\((.*)\\)");
             std::regex re_optional_dependencies("^optional_dependencies\\s*=\\s*\\((.*)\\)");
+            std::regex re_any_func(R"(^([_A-Za-z]\w*)\s*\(\)\s*\{)");
+
+            static const std::unordered_set<std::string> builtinFuncs = {
+                "prepare", "compile", "verify", "assemble"};
 
             bool in_prepare = false;
             bool in_compile = false;
@@ -166,13 +211,42 @@ namespace Starpack
             std::string line;
             std::smatch match;
 
+            bool in_custom = false;
+            std::ostringstream custom_stream;
+
             while (std::getline(file, line))
             {
+
                 std::string trimmed = trim(line);
                 // Skip empty lines or commented lines (#)
                 if (trimmed.empty() || trimmed[0] == '#')
                 {
                     continue;
+                }
+
+                std::smatch match;
+
+                if (!in_custom && std::regex_match(trimmed, match, re_any_func))
+                {
+                    std::string fname = match[1].str();
+                    if (builtinFuncs.count(fname) == 0 && fname.rfind("assemble_", 0) != 0)
+                    {
+                        in_custom = true;
+                        custom_stream.str("");         // reset
+                        custom_stream << line << '\n'; // store first line
+                        continue;                      // proceed reading this block
+                    }
+                }
+
+                if (in_custom)
+                {
+                    custom_stream << line << '\n';
+                    if (trimmed == "}") // closing brace ends the helper
+                    {
+                        in_custom = false;
+                        customFunctions.push_back(custom_stream.str());
+                    }
+                    continue; // don’t let other parsers treat helper lines
                 }
 
                 // 1) package_name = ( "pkg1" "pkg2" ) or package_name = "pkg"
@@ -540,15 +614,24 @@ namespace Starpack
          */
         bool downloadFile(const std::string &url, const std::string &destPath)
         {
-            // If the file already exists, skip the download:
-            if (std::filesystem::exists(destPath))
+            using namespace std::filesystem;
+            uintmax_t existingSize = 0;
+            bool resume = false;
+
+            // 1) If the file already exists, get its size and open in append mode
+            if (exists(destPath))
             {
-                log_message("File already exists, skipping download: " + destPath);
-                return true;
+                existingSize = file_size(destPath);
+                resume = true;
             }
 
-            // Attempt to open the destination file
-            std::ofstream outFile(destPath, std::ios::binary);
+            // Open output stream
+            std::ofstream outFile;
+            if (resume)
+                outFile.open(destPath, std::ios::binary | std::ios::app);
+            else
+                outFile.open(destPath, std::ios::binary | std::ios::trunc);
+
             if (!outFile.is_open())
             {
                 log_error("Could not open file for writing: " + destPath);
@@ -560,86 +643,51 @@ namespace Starpack
             {
                 log_error("Failed to initialize libcurl.");
                 outFile.close();
-                std::filesystem::remove(destPath);
                 return false;
             }
 
-            // Configure libcurl
+            // 2) If resuming, tell curl the byte offset to pick up from
+            if (resume)
+            {
+                curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, static_cast<curl_off_t>(existingSize));
+                log_message("Resuming download of " + url + " at byte " + std::to_string(existingSize));
+            }
+            else
+            {
+                log_message("Starting download: " + url);
+            }
+
+            // Standard curl setup
             curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
             curl_easy_setopt(curl, CURLOPT_USERAGENT, "curl/8.12.1");
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeToFile);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outFile);
             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
 
-            // Enable progress callback
+            // Progress callback (optional)
             curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-            DownloadProgress prog;
-            prog.destFile = destPath;
+            DownloadProgress prog{0, 0.0, destPath};
             curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progressCallback);
             curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &prog);
 
-            // Hard fail on HTTP >= 400
-            curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-            // Low speed detection
-            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 10L);
-            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
-
-            // Perform the download
+            // Perform
             CURLcode res = curl_easy_perform(curl);
-            fprintf(stderr, "\n"); // newline after progress bar
+            fprintf(stderr, "\n");
 
-            bool stream_error_after_loop = !outFile.good();
-            curl_off_t expected_size = -1; // from server
-            curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &expected_size);
-
-            // Must close the file before checking file_size
             outFile.close();
 
             if (res != CURLE_OK)
             {
-                log_error("curl_easy_perform() failed: (" + std::to_string(res) + ") " + std::string(curl_easy_strerror(res)) + " for URL: " + url);
+                log_error("curl_easy_perform() failed: " + std::string(curl_easy_strerror(res)));
                 std::filesystem::remove(destPath);
                 curl_easy_cleanup(curl);
                 return false;
             }
 
-            if (stream_error_after_loop)
-            {
-                log_error("Output file stream error occurred after download for: " + destPath);
-                std::filesystem::remove(destPath);
-                curl_easy_cleanup(curl);
-                return false;
-            }
-
-            // Compare file size if it have an expected content length
-            std::error_code ec;
-            uintmax_t actual_size = std::filesystem::file_size(destPath, ec);
-            if (ec)
-            {
-                log_error("Could not get file size after download for: " + destPath + ". Error: " + ec.message());
-                std::filesystem::remove(destPath);
-                curl_easy_cleanup(curl);
-                return false;
-            }
-
-            if (expected_size != -1 && static_cast<curl_off_t>(actual_size) != expected_size)
-            {
-                log_error("Download incomplete or corrupt: expected " + std::to_string(expected_size) + " bytes but got " + std::to_string(actual_size) + " bytes for " + destPath);
-                std::filesystem::remove(destPath);
-                curl_easy_cleanup(curl);
-                return false;
-            }
-
-            if (expected_size != -1)
-            {
-                log_message("Download size verified for " + destPath + " (" + std::to_string(actual_size) + " bytes).");
-            }
-            else
-            {
-                log_message("Download completed for " + destPath + " (" + std::to_string(actual_size) + " bytes). Server did not provide expected size.");
-            }
-
+            // Verify final size if available...
             curl_easy_cleanup(curl);
+            log_message("Download completed: " + destPath);
             return true;
         }
 
@@ -682,19 +730,54 @@ namespace Starpack
          */
         bool extractArchive(const std::string &archivePath)
         {
-            // Check if the file is an archive by MIME type
+            // 1) If it doesn’t look like an archive, skip.
             if (!isArchiveFile(archivePath))
             {
                 log_message("Not an archive, skipping extraction: " + archivePath);
                 return true;
             }
 
-            // If user appended "NOEXTRACT" to the source, skip actual extraction
+            // 2) NOEXTRACT override
             if (archivePath.find("NOEXTRACT") != std::string::npos)
             {
-                log_message("NOEXTRACT flag found; copying archive without extraction: " + archivePath);
+                log_message("NOEXTRACT flag found; skipping extraction: " + archivePath);
                 return true;
             }
+
+            // 3) Compute the expected output directory, e.g. "./foo-1.2.3" for "foo-1.2.3.tar.xz"
+            std::string filename = std::filesystem::path(archivePath).filename().string();
+            static const std::vector<std::string> exts = {
+                ".tar.xz", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".zip"};
+            std::string base = filename;
+            for (auto &ext : exts)
+            {
+                if (base.size() > ext.size() && base.substr(base.size() - ext.size()) == ext)
+                {
+                    base.erase(base.size() - ext.size());
+                    break;
+                }
+            }
+            fs::path destDir = fs::path("./") / base;
+
+            // 4) If destDir exists and isn’t empty, assume already extracted
+            std::error_code ec;
+            if (fs::exists(destDir, ec) && fs::is_directory(destDir, ec))
+            {
+                bool hasContent = false;
+                for (auto &p : fs::directory_iterator(destDir, fs::directory_options::skip_permission_denied, ec))
+                {
+                    hasContent = true;
+                    break;
+                }
+                if (!ec && hasContent)
+                {
+                    log_message("Archive already extracted, skipping: " + archivePath);
+                    return true;
+                }
+            }
+
+            // 5) Otherwise, proceed to extract
+            log_message("Extracting archive: " + archivePath);
 
             struct archive *a = archive_read_new();
             archive_read_support_format_zip(a);
@@ -715,18 +798,18 @@ namespace Starpack
             while (archive_read_next_header(a, &entry) == ARCHIVE_OK)
             {
                 const char *currentFile = archive_entry_pathname(entry);
-                std::string fullOutputPath = std::string("./") + currentFile;
+                fs::path fullOutputPath = fs::path("./") / currentFile;
 
-                std::filesystem::create_directories(std::filesystem::path(fullOutputPath).parent_path());
+                // Create parent directories
+                fs::create_directories(fullOutputPath.parent_path(), ec);
 
-                // Switch based on file type
+                // Handle directories, symlinks, and regular files as before…
                 if (archive_entry_filetype(entry) == AE_IFDIR)
                 {
-                    std::filesystem::create_directories(fullOutputPath);
-                    auto mode = archive_entry_perm(entry);
-                    std::filesystem::permissions(fullOutputPath,
-                                                 static_cast<std::filesystem::perms>(mode),
-                                                 std::filesystem::perm_options::replace);
+                    fs::create_directories(fullOutputPath, ec);
+                    fs::permissions(fullOutputPath,
+                                    static_cast<fs::perms>(archive_entry_perm(entry)),
+                                    fs::perm_options::replace, ec);
                 }
                 else if (archive_entry_filetype(entry) == AE_IFLNK)
                 {
@@ -737,25 +820,24 @@ namespace Starpack
                         archive_read_free(a);
                         return false;
                     }
-                    std::error_code ec;
-                    std::filesystem::create_symlink(linkTarget, fullOutputPath, ec);
+                    fs::create_symlink(linkTarget, fullOutputPath, ec);
                     if (ec)
                     {
-                        log_error("Failed to create symlink " + fullOutputPath + " -> " + linkTarget + ": " + ec.message());
+                        log_error("Failed to create symlink " + fullOutputPath.string() +
+                                  " -> " + linkTarget + ": " + ec.message());
                         archive_read_free(a);
                         return false;
                     }
                 }
-                else if (archive_entry_size(entry) > 0)
+                else // regular file
                 {
                     std::ofstream outFile(fullOutputPath, std::ios::binary);
                     if (!outFile.is_open())
                     {
-                        log_error("Could not open for writing: " + fullOutputPath);
+                        log_error("Could not open for writing: " + fullOutputPath.string());
                         archive_read_free(a);
                         return false;
                     }
-
                     const void *buff;
                     size_t size;
                     la_int64_t offset;
@@ -763,10 +845,8 @@ namespace Starpack
                     {
                         int r = archive_read_data_block(a, &buff, &size, &offset);
                         if (r == ARCHIVE_EOF)
-                        {
                             break;
-                        }
-                        else if (r < ARCHIVE_OK)
+                        if (r < ARCHIVE_OK)
                         {
                             log_error("archive_read_data_block: " + std::string(archive_error_string(a)));
                             outFile.close();
@@ -776,10 +856,9 @@ namespace Starpack
                         outFile.write(reinterpret_cast<const char *>(buff), size);
                     }
                     outFile.close();
-                    auto mode = archive_entry_perm(entry);
-                    std::filesystem::permissions(fullOutputPath,
-                                                 static_cast<std::filesystem::perms>(mode),
-                                                 std::filesystem::perm_options::replace);
+                    fs::permissions(fullOutputPath,
+                                    static_cast<fs::perms>(archive_entry_perm(entry)),
+                                    fs::perm_options::replace, ec);
                 }
             }
 
@@ -1071,37 +1150,48 @@ namespace Starpack
                                 const std::string &pkg_packagedir,
                                 const std::string &srcdir,
                                 const std::string &package_name,
-                                const std::string &package_version)
+                                const std::string &package_version,
+                                const std::vector<std::string> &customFuncs)
         {
-            if (script.empty())
-            {
+            // Nothing to do if there's no script body
+            if (script.empty() && customFuncs.empty())
                 return true;
-            }
 
-            // Escape single quotes for correct embedding in 'bash -c'
-            std::string escapedScript = script;
-            size_t pos = 0;
-            while ((pos = escapedScript.find('\'', pos)) != std::string::npos)
+            // 1) Combine helper‐function definitions + the real script
+            std::string fullScript;
+            for (auto const &fnDef : customFuncs)
             {
-                escapedScript.replace(pos, 1, "'\\''");
-                pos += 4;
+                fullScript += fnDef;
+                if (fnDef.back() != '\n')
+                    fullScript += "\n";
+            }
+            fullScript += script;
+
+            // 2) Escape single quotes for safe embedding in bash -c '…'
+            std::string escaped;
+            escaped.reserve(fullScript.size() * 2);
+            for (char c : fullScript)
+            {
+                if (c == '\'')
+                    escaped += R"('\'' )"; // end-quote, escaped-quote, reopen
+                else
+                    escaped += c;
             }
 
-            std::string cmdPrefix = useFakeroot ? "fakeroot " : "";
-            std::string cmd =
-                cmdPrefix + "/bin/bash -c '"
-                            "export pkgdir=\"" +
-                pkg_packagedir + "\" && "
-                                 "export packagedir=\"" +
-                pkg_packagedir + "\" && "
-                                 "export srcdir=\"" +
-                srcdir + "\" && "
-                         "export package_name=\"" +
-                package_name + "\" && "
-                               "export package_version=\"" +
-                package_version + "\" && " + escapedScript + "'";
+            // 3) Build the environment+command string
+            std::string prefix = useFakeroot ? "fakeroot " : "";
+            std::ostringstream cmd;
+            cmd << prefix << "/bin/bash -c '"
+                << "export pkgdir=\"" << pkg_packagedir << "\" && "
+                << "export packagedir=\"" << pkg_packagedir << "\" && "
+                << "export srcdir=\"" << srcdir << "\" && "
+                << "export package_name=\"" << package_name << "\" && "
+                << "export package_version=\"" << package_version << "\" && "
+                << escaped
+                << "'";
 
-            int ret = std::system(cmd.c_str());
+            // 4) Execute
+            int ret = std::system(cmd.str().c_str());
             return (ret == 0);
         }
 
@@ -1301,7 +1391,7 @@ namespace Starpack
                 << "--transform=\"s|^\\./hooks|hooks|\" "
                 << "--transform='s|^\\./|files/|' "
                 << "-cf - ."
-                << " | zstd --ultra --long -22 -v" // Added zstd compression
+                << " | zstd --ultra --long -22 -T0 -v" // Added zstd compression, added multi core compression (4/20/25)
                 << " > " << shellEscape(outputFile);
 
             log_message("Running tar command:\n" + cmd.str());
@@ -1324,15 +1414,22 @@ namespace Starpack
          * @param starbuildDir The directory containing STARBUILD.
          * @param intermediatePaths A list of local filenames or directories to remove.
          */
-        void cleanupBuildArtifacts(const fs::path &starbuildDir,
-                                   const std::vector<std::string> &intermediatePaths)
+        void cleanupBuildArtifacts(
+            const fs::path &starbuildDir,
+            const std::vector<std::string> &intermediatePaths)
         {
-            fs::path filesDir = starbuildDir / "files";
-            if (fs::exists(filesDir))
+            // 1) Remove the per-package staging area
+            fs::path pkgsDir = starbuildDir / "packages";
+            if (fs::exists(pkgsDir))
             {
-                fs::remove_all(filesDir);
-                log_message("Removed directory: " + filesDir.string());
+                fs::remove_all(pkgsDir);
+                log_message("Removed directory: " + pkgsDir.string());
             }
+
+            // 2) Remove downloaded archives and clones, plus their extracted dirs
+            const std::vector<std::string> archiveExts = {
+                ".tar.xz", ".tar.gz", ".tar.bz2", ".tgz", ".tbz2", ".zip"};
+
             for (const auto &pathStr : intermediatePaths)
             {
                 fs::path p = starbuildDir / pathStr;
@@ -1340,6 +1437,23 @@ namespace Starpack
                 {
                     fs::remove_all(p);
                     log_message("Removed: " + p.string());
+                }
+
+                // 3) Try to strip off a known archive suffix and remove that dir too
+                for (auto &ext : archiveExts)
+                {
+                    if (pathStr.size() > ext.size() &&
+                        pathStr.substr(pathStr.size() - ext.size()) == ext)
+                    {
+                        std::string base = pathStr.substr(0, pathStr.size() - ext.size());
+                        fs::path extractedDir = starbuildDir / base;
+                        if (fs::exists(extractedDir) && fs::is_directory(extractedDir))
+                        {
+                            fs::remove_all(extractedDir);
+                            log_message("Removed extracted dir: " + extractedDir.string());
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1362,6 +1476,13 @@ namespace Starpack
         {
             using namespace std::filesystem;
 
+            // Determine the directory
+            fs::path sbDir = absolute(starbuildPath).parent_path();
+
+            // Try to pick up a previous run
+            bool isResuming = loadResumeState(sbDir);
+            bool skipping = isResuming;
+
             std::vector<std::string> package_names;
             std::vector<std::string> package_descriptions;
             std::unordered_map<std::string, std::vector<std::string>> subpackageDependencies;
@@ -1380,6 +1501,7 @@ namespace Starpack
 
             std::unordered_map<std::string, std::string> assemble_functions;
             std::vector<std::pair<std::string, std::string>> symlinkPairs;
+            std::vector<std::string> customFunctions;
 
             // 1) Parse the STARBUILD file
             if (!parse_starbuild(
@@ -1391,7 +1513,6 @@ namespace Starpack
                     description,
                     dependencies,
                     build_dependencies,
-                    // NEW
                     clashes,
                     gives,
                     optional_dependencies,
@@ -1401,7 +1522,8 @@ namespace Starpack
                     verify_function,
                     generic_assemble_function,
                     assemble_functions,
-                    symlinkPairs))
+                    symlinkPairs,
+                    customFunctions))
             {
                 log_error("Failed to parse STARBUILD: " + starbuildPath);
                 return false;
@@ -1425,27 +1547,68 @@ namespace Starpack
                 return false;
             }
 
-            // 3) run prepare(), compile(), verify() globally
-            log_message("Running prepare()...");
-            if (!runWithBash(prepare_function, srcdir, srcdir, package_names[0], package_version))
+            // 3a) PREPARE
+            if (!skipping || currentState.phase == "prepare")
             {
-                log_error("prepare() failed.");
-                return false;
+                skipping = false;
+                currentState = {"prepare", 0};
+                saveResumeState(sbDir);
+
+                log_message("Running prepare()...");
+                if (!runWithBash(prepare_function,
+                                 sbDir.string(), // pkgdir == srcdir for global steps
+                                 sbDir.string(),
+                                 package_names[0],
+                                 package_version,
+                                 customFunctions))
+                {
+                    log_error("prepare() failed.");
+                    return false;
+                }
             }
 
-            log_message("Running compile()...");
-            if (!runWithBash(compile_function, srcdir, srcdir, package_names[0], package_version))
+            // 3b) COMPILE
+            if (!skipping || currentState.phase == "compile")
             {
-                log_error("compile() failed.");
-                return false;
+                skipping = false;
+                currentState = {"compile", 0};
+                saveResumeState(sbDir);
+
+                log_message("Running compile()...");
+                if (!runWithBash(compile_function,
+                                 sbDir.string(),
+                                 sbDir.string(),
+                                 package_names[0],
+                                 package_version,
+                                 customFunctions))
+                {
+                    log_error("compile() failed.");
+                    return false;
+                }
             }
 
-            log_message("Running verify()...");
-            if (!runWithBash(verify_function, srcdir, srcdir, package_names[0], package_version))
+            // 3c) VERIFY
+            if (!skipping || currentState.phase == "verify")
             {
-                log_error("verify() failed.");
-                return false;
+                skipping = false;
+                currentState = {"verify", 0};
+                saveResumeState(sbDir);
+
+                log_message("Running verify()...");
+                if (!runWithBash(verify_function,
+                                 sbDir.string(),
+                                 sbDir.string(),
+                                 package_names[0],
+                                 package_version,
+                                 customFunctions))
+                {
+                    log_error("verify() failed.");
+                    return false;
+                }
             }
+
+            // If you get here, all three steps succeeded—clear the resume marker for these phases
+            clearResumeState();
 
             // 4) For each subpackage, assemble and post-process
             for (size_t i = 0; i < package_names.size(); i++)
@@ -1454,59 +1617,26 @@ namespace Starpack
 
                 // Staging directory "packages/pkgName/files"
                 fs::path pkgDir = starbuildDir / "packages" / pkgName / "files";
-                create_directories(pkgDir);
+                fs::create_directories(pkgDir);
                 std::string pkg_packagedir = pkgDir.string();
 
-                // If single package, auto-copy hooks. If multiple, skip
-                if (package_names.size() == 1)
-                {
-                    // Create universal-hooks directory
-                    fs::path universalHooksDir = pkgDir / "etc" / "starpack.d" / "universal-hooks";
-                    fs::create_directories(universalHooksDir);
-                    std::regex singleHookPattern("^(?!\\d).+\\.hook$", std::regex_constants::icase);
-                    for (auto &entry : fs::directory_iterator(starbuildDir))
-                    {
-                        if (!entry.is_regular_file())
-                            continue;
-                        std::string filename = entry.path().filename().string();
-                        if (std::regex_match(filename, singleHookPattern))
-                        {
-                            fs::path dest = universalHooksDir / filename;
-                            try
-                            {
-                                fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing);
-                                log_message("Auto-copied hook " + filename + " => " + dest.string());
-                            }
-                            catch (const fs::filesystem_error &ex)
-                            {
-                                log_error("Failed to copy hook " + filename + ": " + ex.what());
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // Multi-package scenario
-                    log_message("Multiple packages detected; auto-hook copying is disabled for " + pkgName);
-                }
-
-                // Create a new hooks directory in the package staging area.
+                // Prepare hook destinations:
+                //  • numeric‑prefixed → pkgDir/etc/starpack.d/universal-hooks
+                //  • others          → pkgDir/hooks
+                fs::path etcUniversalDir = pkgDir / "etc" / "starpack.d" / "universal-hooks";
+                fs::create_directories(etcUniversalDir);
                 fs::path pkgHooksDir = pkgDir / "hooks";
                 fs::create_directories(pkgHooksDir);
 
-                // Build a regex pattern that matches filenames starting with the package name followed by a hyphen,
-                // and ending with ".hook". It captures the hook phase.
-                std::regex hookPattern(("^" + pkgName + "-(.+\\.hook)$").c_str(), std::regex_constants::icase);
-
                 bool singlePackageBuild = (package_names.size() == 1);
-
+                // Matches either “phase.hook” or “pkgName-phase.hook”
                 std::regex hookPattern(
                     singlePackageBuild
-                        ? ("^(" + pkgName + "-)?(.+\\.hook)$") // 2nd group = "phase.hook"
-                        : ("^" + pkgName + "-(.+\\.hook)$"),   // 1st group = "phase.hook"
+                        ? ("^(" + pkgName + "-)?(.+\\.hook)$") // group 2 = “phase.hook”
+                        : ("^" + pkgName + "-(.+\\.hook)$"),   // group 1 = “phase.hook”
                     std::regex_constants::icase);
 
-                // Iterate over the starbuild directory files.
+                // Copy hooks out of the root starbuildDir
                 for (const auto &entry : fs::directory_iterator(starbuildDir))
                 {
                     if (!entry.is_regular_file())
@@ -1514,45 +1644,69 @@ namespace Starpack
 
                     const std::string filename = entry.path().filename().string();
                     std::smatch match;
+                    if (!std::regex_match(filename, match, hookPattern))
+                        continue;
 
-                    if (std::regex_match(filename, match, hookPattern))
+                    fs::path dest;
+                    // 1) numeric‑prefixed → universal-hooks
+                    if (!filename.empty() && std::isdigit(static_cast<unsigned char>(filename[0])))
                     {
-                        // Determine the final filename stored in the package.
-                        std::string newFilename = singlePackageBuild ? match[2].str()  // "phase.hook"
-                                                                     : match[1].str(); // "phase.hook"
+                        dest = etcUniversalDir / filename;
+                    }
+                    // 2) otherwise → hooks/<phase>.hook
+                    else
+                    {
+                        // strip off “pkgName-” if present, else take phase directly
+                        std::string phase = singlePackageBuild
+                                                ? match[2].str()
+                                                : match[1].str();
+                        dest = pkgHooksDir / phase;
+                    }
 
-                        fs::path dest = pkgHooksDir / newFilename;
-                        try
-                        {
-                            fs::copy_file(entry.path(), dest,
-                                          fs::copy_options::overwrite_existing);
-                            log_message("Copied hook " + filename + " → " + dest.string());
-                        }
-                        catch (const fs::filesystem_error &ex)
-                        {
-                            log_error("Failed to copy hook " + filename + ": " + ex.what());
-                        }
+                    try
+                    {
+                        fs::copy_file(entry.path(), dest,
+                                      fs::copy_options::overwrite_existing);
+                        log_message("Installed hook " + filename +
+                                    " → " + dest.string());
+                    }
+                    catch (const fs::filesystem_error &ex)
+                    {
+                        log_error("Failed to copy hook " + filename +
+                                  ": " + ex.what());
                     }
                 }
 
-                // 4a) run assemble_<pkg> or assemble() if no subpackage assembly
+                // 4) For each subpackage, assemble (with resume support) and record outputs
                 log_message("Assembling package: " + pkgName);
+
                 bool assembleResult = false;
                 auto it = assemble_functions.find(pkgName);
+
                 if (it != assemble_functions.end())
                 {
-                    log_message("Running assemble_" + pkgName + "() function...");
-                    assembleResult = runWithBash(it->second, pkg_packagedir, srcdir, pkgName, package_version);
+                    // assemble_<pkg>()
+                    assembleResult = runWithBash(it->second,
+                                                 pkg_packagedir,
+                                                 srcdir,
+                                                 pkgName,
+                                                 package_version,
+                                                 customFunctions);
                 }
                 else if (!generic_assemble_function.empty())
                 {
-                    log_message("Running assemble() function for package " + pkgName + "...");
-                    assembleResult = runWithBash(generic_assemble_function, pkg_packagedir, srcdir, pkgName, package_version);
+                    // generic assemble()
+                    assembleResult = runWithBash(generic_assemble_function,
+                                                 pkg_packagedir,
+                                                 srcdir,
+                                                 pkgName,
+                                                 package_version,
+                                                 customFunctions);
                 }
                 else
                 {
-                    log_message("No assemble function defined for package " + pkgName + ". Skipping assemble phase.");
-                    assembleResult = true; // OK
+                    // no assemble code for this sub-pkg – that’s OK
+                    assembleResult = true;
                 }
 
                 if (!assembleResult)

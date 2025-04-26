@@ -103,7 +103,8 @@ bool parse_starbuild(const std::string &filepath,
     std::string &verify_function,
     std::string &assemble_function,
     std::vector<std::string> &hooks,
-    std::vector<std::pair<std::string, std::string>> &symlinkPairs
+    std::vector<std::pair<std::string, std::string>> &symlinkPairs,
+    std::vector<std::string> &customFunctions
 );
 
 // ---------------------------------------------------------------------------
